@@ -1,27 +1,27 @@
 /*
- * File    : buck_2pi.c
+ * File    : ctrl.c
  * Abstract:
  *   C MEX S-function for a buck converter with dual-loop PI control
- *   (voltage outer loop + current inner loop).
+ *   and internal PWM generation (center-aligned / triangle carrier).
  *
  *   Input ports (8):
  *     0: Vout       - output voltage
  *     1: IL         - inductor current
- *     2: Vdc        - input DC voltage (not used in this simple PI, kept for future)
- *     3: Vref       - voltage reference
- *     4: Kp_u       - voltage loop proportional gain
- *     5: Ki_u       - voltage loop integral gain
- *     6: Kp_i       - current loop proportional gain
- *     7: Ki_i       - current loop integral gain
+ *     2: Vref       - voltage reference
+ *     3: Kp_u       - voltage loop proportional gain
+ *     4: Ki_u       - voltage loop integral gain
+ *     5: Kp_i       - current loop proportional gain
+ *     6: Ki_i       - current loop integral gain
+ *     7: deadtime   - dead time in seconds
  *
- *   Output port:
- *     0: duty cycle d (range 0..1)
+ *   Output ports:
+ *     0: PWMA signal (0 or 1)
+ *     1: PWMB signal (0 or 1, complementary with dead time)
  *
- *   Discrete states:
- *     0: integral of voltage error  (integral_v)
- *     1: integral of current error  (integral_i)
- *
- *   Sample time: inherited from the driving block (INHERITED_SAMPLE_TIME)
+ *   Timing:
+ *     Sample rate: 100 MHz (10 ns per step)
+ *     PWM frequency: 20 kHz (5000 steps per period)
+ *     PI update rate: 20 kHz (once per PWM period)
  *
  * Copyright 2025
  */
@@ -30,173 +30,181 @@
 #define S_FUNCTION_LEVEL 2
 
 #include "simstruc.h"
+#include "pi_ctrl.h"
+
+#include <stdlib.h>
+
+/* PWM and timing parameters */
+#define PWM_FREQ      20000.0
+#define SAMPLE_FREQ   50000000.0
+#define STEPS_PER_PWM ((int_T)(SAMPLE_FREQ / PWM_FREQ))
+#define HALF_PERIOD   (STEPS_PER_PWM / 2)
+
+/* Saturation limits */
+#define IREF_MAX  10.0
+#define IREF_MIN   0.0
+#define DUTY_MAX   1.0
+#define DUTY_MIN   0.0
+
+/* Number of input ports */
+#define NUM_INPUTS 8
+
+/* Input port indices */
+#define PORT_VOUT     0
+#define PORT_IL       1
+#define PORT_VREF     2
+#define PORT_KP_U     3
+#define PORT_KI_U     4
+#define PORT_KP_I     5
+#define PORT_KI_I     6
+#define PORT_DEADTIME 7
+
+/* PWork indices */
+#define PWORK_PI_V  0
+#define PWORK_PI_I  1
+
+/* IWork indices */
+#define IWORK_CNT   0
+
+/* RWork indices */
+#define RWORK_DUTY  0
 
 /*====================*
  * S-function methods *
  *====================*/
 
-/* Function: mdlInitializeSizes ===============================================
- * Abstract:
- *    Set up numbers of inputs, outputs, states, etc.
- */
 static void mdlInitializeSizes(SimStruct *S)
 {
-    /* No dialog parameters – everything comes through input ports */
+    int_T i;
+
     ssSetNumSFcnParams(S, 0);
     if (ssGetNumSFcnParams(S) != ssGetSFcnParamsCount(S)) {
         return;
     }
 
-    /* Two discrete states: voltage integral & current integral */
     ssSetNumContStates(S, 0);
-    ssSetNumDiscStates(S, 2);
+    ssSetNumDiscStates(S, 0);
 
-    /* Eight input ports, all scalar */
-    if (!ssSetNumInputPorts(S, 8)) return;
-    int_T i;
-    for (i = 0; i < 8; i++) {
+    if (!ssSetNumInputPorts(S, NUM_INPUTS)) return;
+    for (i = 0; i < NUM_INPUTS; i++) {
         ssSetInputPortWidth(S, i, 1);
-        /* All inputs have direct feedthrough because they are used in Outputs */
         ssSetInputPortDirectFeedThrough(S, i, 1);
         ssSetInputPortRequiredContiguous(S, i, 1);
     }
 
-    /* One output port (duty cycle) */
-    if (!ssSetNumOutputPorts(S, 1)) return;
+    if (!ssSetNumOutputPorts(S, 2)) return;
     ssSetOutputPortWidth(S, 0, 1);
+    ssSetOutputPortWidth(S, 1, 1);
 
-    /* One sample time (inherited) */
     ssSetNumSampleTimes(S, 1);
 
-    /* No extra work vectors */
-    ssSetNumRWork(S, 0);
-    ssSetNumIWork(S, 0);
-    ssSetNumPWork(S, 0);
+    ssSetNumRWork(S, 1);
+    ssSetNumIWork(S, 1);
+    ssSetNumPWork(S, 2);
     ssSetNumModes(S, 0);
     ssSetNumNonsampledZCs(S, 0);
 
     ssSetOptions(S, SS_OPTION_EXCEPTION_FREE_CODE);
 }
 
-/* Function: mdlInitializeSampleTimes =========================================
- * Abstract:
- *    Inherit sample time from the model's discrete solver step.
- */
 static void mdlInitializeSampleTimes(SimStruct *S)
 {
-    ssSetSampleTime(S, 0, 0.0);
+    ssSetSampleTime(S, 0, 1.0 / SAMPLE_FREQ);
     ssSetOffsetTime(S, 0, 0.0);
     ssSetModelReferenceSampleTimeDefaultInheritance(S);
 }
 
-/* Function: mdlInitializeConditions ==========================================
- * Abstract:
- *    Initialize both integrators to zero.
- */
-#define MDL_INITIALIZE_CONDITIONS
-static void mdlInitializeConditions(SimStruct *S)
+#define MDL_START
+static void mdlStart(SimStruct *S)
 {
-    real_T *x = ssGetRealDiscStates(S);
-    x[0] = 0.0;   /* integral_v */
-    x[1] = 0.0;   /* integral_i */
+    void **pwork = ssGetPWork(S);
+    PI_Ctrl *pi_v = (PI_Ctrl *)malloc(sizeof(PI_Ctrl));
+    PI_Ctrl *pi_i = (PI_Ctrl *)malloc(sizeof(PI_Ctrl));
+
+    PI_Init(pi_v, IREF_MIN, IREF_MAX);
+    PI_Init(pi_i, DUTY_MIN, DUTY_MAX);
+
+    pwork[PWORK_PI_V] = pi_v;
+    pwork[PWORK_PI_I] = pi_i;
+
+    ssGetIWork(S)[IWORK_CNT] = 0;
+    ssGetRWork(S)[RWORK_DUTY] = 0.0;
 }
 
-/* Function: mdlOutputs =======================================================
- * Abstract:
- *    Compute duty cycle using dual-loop PI:
- *      Iref = Kp_u*(Vref - Vout) + Ki_u * integral_v   (saturated)
- *      d    = Kp_i*(Iref - IL)   + Ki_i * integral_i     (saturated 0..1)
- */
 static void mdlOutputs(SimStruct *S, int_T tid)
 {
-    /* Get input signals */
-    const real_T *Vout  = ssGetInputPortRealSignal(S, 0);
-    const real_T *IL    = ssGetInputPortRealSignal(S, 1);
-    /* Vdc = ssGetInputPortRealSignal(S,2) – not used */
-    const real_T *Vref  = ssGetInputPortRealSignal(S, 3);
-    const real_T *Kp_u  = ssGetInputPortRealSignal(S, 4);
-    const real_T *Ki_u  = ssGetInputPortRealSignal(S, 5);
-    const real_T *Kp_i  = ssGetInputPortRealSignal(S, 6);
-    const real_T *Ki_i  = ssGetInputPortRealSignal(S, 7);
+    const real_T *Vout     = ssGetInputPortRealSignal(S, PORT_VOUT);
+    const real_T *IL       = ssGetInputPortRealSignal(S, PORT_IL);
+    const real_T *Vref     = ssGetInputPortRealSignal(S, PORT_VREF);
+    const real_T *Kp_u     = ssGetInputPortRealSignal(S, PORT_KP_U);
+    const real_T *Ki_u     = ssGetInputPortRealSignal(S, PORT_KI_U);
+    const real_T *Kp_i     = ssGetInputPortRealSignal(S, PORT_KP_I);
+    const real_T *Ki_i     = ssGetInputPortRealSignal(S, PORT_KI_I);
+    const real_T *deadtime = ssGetInputPortRealSignal(S, PORT_DEADTIME);
+    real_T *pwma = ssGetOutputPortRealSignal(S, 0);
+    real_T *pwmb = ssGetOutputPortRealSignal(S, 1);
+    int_T *iwork = ssGetIWork(S);
+    real_T *rwork = ssGetRWork(S);
+    void **pwork = ssGetPWork(S);
+    PI_Ctrl *pi_v = (PI_Ctrl *)pwork[PWORK_PI_V];
+    PI_Ctrl *pi_i = (PI_Ctrl *)pwork[PWORK_PI_I];
+    int_T cnt, dt_steps;
+    real_T triangle, duty, ev, Iref, ei;
+    real_T duty_upper, duty_lower;
 
-    /* Output pointer */
-    real_T *d = ssGetOutputPortRealSignal(S, 0);
+    cnt = iwork[IWORK_CNT];
 
-    /* State pointers */
-    real_T *x = ssGetRealDiscStates(S);
-    real_T integral_v = x[0];
-    real_T integral_i = x[1];
-
-    /* Voltage loop */
-    real_T ev = Vref[0] - Vout[0];
-    real_T Iref = Kp_u[0] * ev + Ki_u[0] * integral_v;
-
-    /* Clamp Iref to a reasonable range (example 0 .. 10 A) */
-    if (Iref > 10.0) Iref = 10.0;
-    else if (Iref < 0.0) Iref = 0.0;
-
-    /* Current loop */
-    real_T ei = Iref - IL[0];
-    real_T d_raw = Kp_i[0] * ei + Ki_i[0] * integral_i;
-
-    /* Saturate duty cycle to [0, 1] */
-    if (d_raw > 1.0) d_raw = 1.0;
-    else if (d_raw < 0.0) d_raw = 0.0;
-
-    d[0] = d_raw;
-
-    UNUSED_ARG(tid);
-}
-
-/* Function: mdlUpdate ========================================================
- * Abstract:
- *    Update the two integrators:
- *      integral_v += ev * Ts
- *      integral_i += ei * Ts
- *    where Ts is the actual task sample time (inherited).
- */
-#define MDL_UPDATE
-static void mdlUpdate(SimStruct *S, int_T tid)
-{
-    real_T *x = ssGetRealDiscStates(S);
-
-    const real_T *Vout = ssGetInputPortRealSignal(S, 0);
-    const real_T *IL   = ssGetInputPortRealSignal(S, 1);
-    const real_T *Vref = ssGetInputPortRealSignal(S, 3);
-    const real_T *Kp_u = ssGetInputPortRealSignal(S, 4);
-    const real_T *Ki_u = ssGetInputPortRealSignal(S, 5);
-    /* Kp_i, Ki_i not needed for update, only error */
-
-    /* Get actual sample time from solver */
-    real_T Ts = ssGetSampleTime(S, 0);
-    if (Ts <= 0.0) {
-        /* Fallback in case sample time is not yet determined (should not happen) */
-        Ts = 1e-4;
+    if (cnt == 0) {
+        ev   = Vref[0] - Vout[0];
+        Iref = PI_Update(pi_v, Kp_u[0], Ki_u[0], ev);
+        ei   = Iref - IL[0];
+        rwork[RWORK_DUTY] = PI_Update(pi_i, Kp_i[0], Ki_i[0], ei);
     }
 
-    /* Calculate same intermediate Iref as in Outputs to obtain ei */
-    real_T ev = Vref[0] - Vout[0];
-    real_T integral_v = x[0];
-    real_T Iref = Kp_u[0] * ev + Ki_u[0] * integral_v;
-    if (Iref > 10.0) Iref = 10.0;
-    else if (Iref < 0.0) Iref = 0.0;
+    duty = rwork[RWORK_DUTY];
 
-    real_T ei = Iref - IL[0];
+    /* Dead time in steps */
+    dt_steps = (int_T)(deadtime[0] * SAMPLE_FREQ);
 
-    /* Integrate */
-    x[0] += ev * Ts;
-    x[1] += ei * Ts;
+    /* Effective duty thresholds with dead time offset (in normalized carrier units) */
+    duty_upper = duty - (real_T)dt_steps / (real_T)HALF_PERIOD;
+    duty_lower = duty + (real_T)dt_steps / (real_T)HALF_PERIOD;
+    if (duty_upper < 0.0) duty_upper = 0.0;
+    if (duty_lower > 1.0) duty_lower = 1.0;
+
+    /* Triangle carrier */
+    if (cnt < HALF_PERIOD) {
+        triangle = (real_T)cnt / (real_T)HALF_PERIOD;
+    } else {
+        triangle = (real_T)(STEPS_PER_PWM - cnt) / (real_T)HALF_PERIOD;
+    }
+
+    /* PWMA: on when duty > triangle (shrunk inward by dead time) */
+    pwma[0] = (duty_upper >= triangle) ? 1.0 : 0.0;
+
+    /* PWMB: complementary, on when triangle > duty (shrunk inward by dead time) */
+    pwmb[0] = (triangle >= duty_lower) ? 1.0 : 0.0;
+
+    cnt++;
+    if (cnt >= STEPS_PER_PWM) {
+        cnt = 0;
+    }
+    iwork[IWORK_CNT] = cnt;
 
     UNUSED_ARG(tid);
 }
 
-/* Function: mdlTerminate =====================================================
- * Abstract:
- *    No cleanup required.
- */
 static void mdlTerminate(SimStruct *S)
 {
-    UNUSED_ARG(S);
+    void **pwork = ssGetPWork(S);
+    if (pwork[PWORK_PI_V] != NULL) {
+        free(pwork[PWORK_PI_V]);
+        pwork[PWORK_PI_V] = NULL;
+    }
+    if (pwork[PWORK_PI_I] != NULL) {
+        free(pwork[PWORK_PI_I]);
+        pwork[PWORK_PI_I] = NULL;
+    }
 }
 
 /*=============================*
